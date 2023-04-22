@@ -1,0 +1,77 @@
+#Importing required package
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import expr
+from pyspark.sql.functions import regexp_replace
+from delta.tables import *
+import re
+
+#Creates Empty RDD using parallelize
+rdd2= spark.sparkContext.parallelize([])
+
+#Create Null Schema
+from pyspark.sql.types import StructType,StructField, StringType
+schema = StructType([
+  StructField('Post_ID', StringType(), True)
+  ])
+
+#Setting file path
+files = mssparkutils.fs.ls('abfss://<containerName>/<FolderName>/PostData/')
+
+#Creating Empty DataFrame
+merged_df =spark.createDataFrame(rdd2,schema)
+
+#Looping Each files and creating a single dataframe
+for file in files:
+    n=[]
+    #Remove all the special character which are not allow in spark tables
+    df = spark.read.option("header",True).option("quote", "\"").option("escape", "\"").option("multiLine", True).load(file.path,format='csv',)
+    n = [ i.replace(' ','_').replace('(','').replace(')','').replace('+','').replace('-','_').replace(',','').replace(':','').replace('\'','').replace('ô','o') for i in df.columns]
+    #Addding new columns to dataframe
+    df2 = df.toDF(*n)
+    merged_df = merged_df.unionByName(df2, allowMissingColumns=True)
+    print(file)
+
+#Taking some columns as FBPost
+df_post1= merged_df.select(merged_df.columns[:67])
+#Delta table load 
+deltaTable = DeltaTable.forPath(spark,'/social_media_raw_data_delta_layer/FBPost')
+
+
+deltaTable.alias("target").merge(
+    source = df_post1.alias("source"),
+    condition = "target.Post_ID = source.Post_ID"
+    ).whenNotMatchedInsertAll(
+    ).execute()
+
+# FBPost_Country_Counts to help show country filter in power bi
+wanted_column_withoutPost=[]
+wanted_column_withoutPost = [x for x in merged_df.columns if re.search('Views_by_country_',x) ]
+num_cols = len(wanted_column_withoutPost)
+Countries = [x.replace('Views_by_country_','') for x in wanted_column_withoutPost ]
+countries_with_quotes = ['"{}"'.format(c) for c in Countries]
+
+wanted_column= wanted_column_withoutPost
+wanted_column.append('Post_ID') 
+wanted_column.append('Publish_time')
+df_post2= merged_df.select(wanted_column)
+
+
+placeholders = ', '.join(['{}'] * (num_cols * 2))
+countries_and_columns = [val for pair in zip(countries_with_quotes, wanted_column_withoutPost) for val in pair]
+unpivotExpr = "stack({}, {}) as (Country, Total)".format(num_cols, placeholders).format(*countries_and_columns)
+
+#Testing different variables
+# print('Number of Wanted Columns:', len(wanted_column_withoutPost))
+# print('Number of country Columns:', len(Countries))
+# print('Number of placeholders:', len(placeholders.split(', ')))
+# print('Number of arguments:', len(countries_and_columns))
+
+unPivotDF = df_post2.select('Post_ID','Publish_time', expr(unpivotExpr)).where("Total is not null")
+
+#Calling second delta table
+deltaTable = DeltaTable.forPath(spark,'/social_media_raw_data_delta_layer/FBPost_Country_Counts')
+deltaTable.alias("target").merge(
+    source = unPivotDF.alias("source"),
+    condition = "target.Post_ID = source.Post_ID and target.Country = source.Country"
+    ).whenNotMatchedInsertAll(
+    ).execute()
